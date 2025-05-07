@@ -1,0 +1,106 @@
+input:
+  file:
+    paths: ["./task.json"]
+    scanner:
+      to_the_end: {}
+pipeline:
+  processors:
+    - log:
+        message: "performing task: ${!this}"
+    - label: 'read_file'
+      branch:
+        processors:
+          - command:
+              name: cat
+              args_mapping: 'root = [this.context]'
+        result_map: 'root.context = content().string()'
+    - mutation: |
+        root.decision = "need_response"
+        root.prompt = """
+        We need to perform the following task.
+
+        ### Task
+        $TASK
+
+        ### Instructions
+        You will not have direct access to the context, but can chat with a small language model which has read the entire thing.
+
+        Feel free to think step-by-step, but eventually you must provide an output in the format below:
+
+        ```json
+        {
+            "message": "<your message to the small language model. If you are asking model to do a task, make sure it is a single task!>"
+        }
+        ```
+        """.trim().replace_all_many(["$TASK", this.question])
+    - while:
+        check: 'this.decision != "provide_final_answer"'
+        max_loops: 2
+        processors:
+          - branch:
+              result_map: 'root = root.assign(this)'
+              processors:
+                - openai_chat_completion:
+                    model: 'gpt-4o'
+                    api_key: '${OPENAI_API_KEY}'
+                    prompt: "${!this.prompt}"
+                - log:
+                    message: "gpt-4o responded with: ${!content().string()}"
+                - mapping: |
+                    root = content().re_find_object("```json\\s*([\\s\\S]*?)\\s*```").0.trim_prefix("```json").trim("`")
+          - branch:
+              request_map: |
+                root = if this.decision == "provide_final_answer" {
+                  deleted()
+                } else {
+                  this
+                }
+              result_map: 'root.response = content().string()'
+              processors:
+                - log:
+                    message: "invoking ollama_chat with task: ${!this.message}, context size: ${!this.context.length()}"
+                - openai_chat_completion:
+                    model: gpt-4o-mini
+                    api_key: '${OPENAI_API_KEY}'
+                    prompt: |
+                      You will help a user perform the following task.
+
+                      Read the context below and prepare to answer questions from an expert user.
+                      ### Context
+                      ${!this.context}
+
+                      ### Question
+                      ${!this.message}
+                - log:
+                    message: "gpt-4o-mini response: ${!content().string()}"
+          - mutation: |
+              root.prompt = """
+              Here is the response from the small language model:
+
+              ### Response
+              $RESPONSE
+
+              ### Instructions
+              Analyze the response and think-step-by-step to determine if you have enough information to answer the question.
+
+              If you have enough information or if the task is complete provide a final answer in the format below.
+
+              ```json
+              {{
+                  "decision": "provide_final_answer", 
+                  "answer": "<your answer>"
+              }}
+              ```
+
+              Otherwise, if the task is not complete, request the small language model to do additional work, by outputting the following:
+
+              ```json
+              {{
+                  "decision": "request_additional_info",
+                  "message": "<your message to the small language model>"
+              }}
+              ```
+              """.trim().replace_all_many(["$RESPONSE", this.response.or("NVM ALL DONE")])
+    - mutation: |
+        root.context = deleted()
+
